@@ -1,6 +1,6 @@
-use std::collections::VecDeque;
 use std::fs;
 use std::io;
+use std::io::Write;
 use std::process;
 use std::time;
 
@@ -73,9 +73,10 @@ fn shutdown() {
 }
 
 fn prompt_user() -> String {
+    let client = ureq::agent();
     let mut msg = String::from("");
     for f in get_folders() {
-        let name = get_game_name(&f);
+        let name = get_game_name(&f, &client);
         let temp = format!("{} - {}\n", &f, &name);
         msg.push_str(&temp);
     }
@@ -83,22 +84,33 @@ fn prompt_user() -> String {
     get_app_id_input()
 }
 
-fn get_game_name(id: &str) -> String {
-    let mut reader = res_match!(req_game_page(id), return "Unknown game".to_string());
-    reader_match_exp(APP_NAME_PREFIX, &mut reader);
-    res_match!(
-        String::from_utf8(op_match!(
-            reader_read_and_store_until(APP_NAME_SUFFIX, &mut reader),
-            return "Unknown game".to_string()
-        )),
+fn get_game_name(id: &str, client: &ureq::Agent) -> String {
+    let mut reader = res_match!(
+        req_game_page(id, &client),
         return "Unknown game".to_string()
-    )
+    );
+    if reader_match_exp(APP_NAME_PREFIX, &mut reader) {
+        return res_match!(
+            String::from_utf8(op_match!(
+                reader_read_and_store_until(APP_NAME_SUFFIX, &mut reader),
+                return "Unknown game".to_string()
+            )),
+            return "Unknown game".to_string()
+        );
+    }
+    "Unknown Game".to_string()
 }
 
-fn req_game_page(id: &str) -> Result<impl io::Read + Send, ureq::Error> {
+fn make_app_page(id: &str) -> String {
     let mut url = APP_URL.to_owned();
     url.push_str(id);
-    let res = ureq::get(&url)
+    url
+}
+
+fn req_game_page(id: &str, client: &ureq::Agent) -> Result<impl io::Read + Send, ureq::Error> {
+    let url = make_app_page(id);
+    let res = client
+        .get(&url)
         .set("Cookie", COOKIE_VAL)
         .set("Connection", "Keep-Alive")
         .set("Keep-Alive", "timeout=30");
@@ -110,19 +122,15 @@ fn req_game_page(id: &str) -> Result<impl io::Read + Send, ureq::Error> {
 
 fn reader_match_exp(exp: &[u8], reader: &mut impl io::Read) -> bool {
     let l = exp.len();
-    let mut buf = vecdeque_with_size(l);
-    let bufref = buf.make_contiguous();
-    res_match!(reader.read_exact(bufref), return false);
-    if bufref == exp {
+    let mut buf = vec![0; l];
+    res_match!(reader.read_exact(&mut buf), return false);
+    if &buf == exp {
         return true;
     }
     loop {
-        bufref.rotate_left(1);
-        res_match!(
-            reader.read_exact(&mut bufref[l - 1..l]),
-            return false
-        );
-        if bufref == exp {
+        buf.rotate_left(1);
+        res_match!(reader.read_exact(&mut buf[l - 1..l]), return false);
+        if buf == exp {
             return true;
         }
     }
@@ -131,24 +139,20 @@ fn reader_match_exp(exp: &[u8], reader: &mut impl io::Read) -> bool {
 fn reader_read_and_store_until(exp: &[u8], reader: &mut impl io::Read) -> Option<Vec<u8>> {
     let mut v = Vec::new();
     let l = exp.len();
-    let mut buf = vecdeque_with_size(l);
-    let bufref = buf.make_contiguous();
-    res_match!(reader.read_exact(bufref), return None);
-    if bufref == exp {
+    let mut buf = vec![0; l];
+    res_match!(reader.read_exact(&mut buf), return None);
+    if &buf == exp {
         return None;
     }
-    v.extend_from_slice(bufref);
+    v.extend_from_slice(&buf);
     loop {
-        bufref.rotate_left(1);
-        res_match!(
-            reader.read_exact(&mut bufref[l - 1..l]),
-            return None
-        );
-        if bufref == exp {
+        buf.rotate_left(1);
+        res_match!(reader.read_exact(&mut buf[l - 1..l]), return None);
+        if &buf == exp {
             rem_n_from_end(&mut v, l - 1);
             return Some(v);
         }
-        v.extend_from_slice(&mut bufref[l - 1..l]);
+        v.extend_from_slice(&mut buf[l - 1..l]);
     }
 }
 
@@ -156,16 +160,19 @@ fn get_folders() -> Vec<String> {
     let folder_iter = res_match!(fs::read_dir(DOWNLOAD_FOLDER), return Vec::new());
     folder_iter
         .filter(|x| {
-            let entry = res_match!(x, panic!("Couldn't read the folder"));
-            entry.metadata().expect("Couldn't read the folder").is_dir()
+            let entry = res_match!(x, {
+                println!("Couldn't read a folder");
+                return false;
+            });
+            res_match!(entry.metadata(), {
+                println!("Couldn't read a folder");
+                return false;
+            })
+            .is_dir()
         })
         .map(|x| {
-            let entry = res_match!(x, panic!("Couldn't read the folder"));
-            entry
-                .file_name()
-                .to_str()
-                .expect("Couldn't read the folder name")
-                .to_string()
+            let entry = res_match!(x, { return "Unknown folder".to_string() });
+            op_match!(entry.file_name().to_str(), { "Unknown folder" }).to_string()
         })
         .collect()
 }
@@ -173,9 +180,12 @@ fn get_folders() -> Vec<String> {
 fn look_for_folder(folder: &str) -> bool {
     let folder_iter = res_match!(fs::read_dir(DOWNLOAD_FOLDER), return false);
     for f in folder_iter {
-        let entry = f.expect("Couldn't read the folder");
+        let entry = res_match!(f, {
+            println!("Couldn't read a folder");
+            continue;
+        });
         let osstr = entry.file_name();
-        let a_folder = osstr.to_str().expect("Couldn't read the folder");
+        let a_folder = op_match!(osstr.to_str(), continue);
         if a_folder == folder {
             return true;
         }
@@ -185,21 +195,14 @@ fn look_for_folder(folder: &str) -> bool {
 
 fn get_app_id_input() -> String {
     use std::io::BufRead;
-    println!("Select a game: ");
+    print!("Select a game: ");
+    let _ = std::io::stdout().flush();
     io::stdin()
         .lock()
         .lines()
         .next()
-        .expect("Couldn't read input")
-        .expect("Couldn't read input")
-}
-
-fn vecdeque_with_size<T: Default>(size: usize) -> VecDeque<T> {
-    let mut v = VecDeque::with_capacity(size);
-    for _ in 0..size {
-        v.push_back(T::default())
-    }
-    v
+        .expect("Couldn't read the input")
+        .expect("Couldn't read the input")
 }
 
 fn rem_n_from_end<T>(v: &mut Vec<T>, n: usize) {
